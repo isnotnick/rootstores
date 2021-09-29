@@ -23,7 +23,7 @@ var certificateCounter int
 
 var certificateStorePEM strings.Builder
 
-var appleURL = "https://opensource.apple.com/source/security_certificates/security_certificates-55161.80.1/certificates/roots/"
+var appleURL = "https://opensource.apple.com/source/security_certificates/security_certificates-55188.140.2/certificates/roots/"
 
 func main() {
 	client := &http.Client{
