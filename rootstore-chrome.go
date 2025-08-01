@@ -1,107 +1,118 @@
-// TO-DO - this code from crt.sh and needs modification.
-
-// A current version of root_store.textproto and root_store.certs can be downloaded from:
-//
-//	https://chromium.googlesource.com/chromium/src/+/main/net/data/ssl/chrome_root_store/root_store.textproto?format=TEXT
-//	https://chromium.googlesource.com/chromium/src/+/main/net/data/ssl/chrome_root_store/root_store.certs?format=TEXT
-//
-// After being downloaded, these files need to be base64-decoded manually.
-//
-// The root_store package is prebuilt using protoc and https://chromium.googlesource.com/chromium/src/+/main/net/cert/root_store.proto
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
-	"crypto/x509"
-	"encoding/hex"
 	"encoding/pem"
-	"flag"
 	"fmt"
-	"log"
+	"io"
+	"net/http"
 	"os"
-
-	"github.com/crtsh/root_programs/chrome_rootstore/root_store"
-
-	"google.golang.org/protobuf/encoding/prototext"
+	"strings"
+	"time"
 )
 
+const (
+	// Using the stable raw file URLs from the official GitHub mirror of Chromium.
+	textprotoURL = "https://raw.githubusercontent.com/chromium/chromium/main/net/data/ssl/chrome_root_store/root_store.textproto"
+	certsURL     = "https://raw.githubusercontent.com/chromium/chromium/main/net/data/ssl/chrome_root_store/root_store.certs"
+)
+
+// downloadRaw fetches a URL and returns its raw body content.
+func downloadRaw(url string) ([]byte, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status for %s: %s", url, resp.Status)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
 func main() {
-	flag.Parse()
-
-	rootStoreFilename := "root_store.textproto"
-	certsFilename := "root_store.certs"
-
-	if len(flag.Args()) > 2 {
-		fmt.Printf("Usage: %s [<root_store.textproto file>] [<root_store.certs file>]\n", os.Args[0])
+	// 1. Download and parse the textproto file to get the set of trusted SHA-256 hashes.
+	fmt.Printf("Downloading trusted hashes from %s...\n", textprotoURL)
+	textprotoData, err := downloadRaw(textprotoURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	if len(flag.Args()) >= 1 {
-		rootStoreFilename = flag.Arg(0)
+	trustedHashes := make(map[string]bool)
+	scanner := bufio.NewScanner(strings.NewReader(string(textprotoData)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Look for lines like: sha256_hex: "..."
+		if strings.HasPrefix(line, "sha256_hex:") {
+			parts := strings.SplitN(line, "\"", 2)
+			if len(parts) == 2 {
+				hash := strings.TrimRight(parts[1], "\"")
+				trustedHashes[hash] = true
+			}
+		}
 	}
-
-	if len(flag.Args()) >= 2 {
-		certsFilename = flag.Arg(1)
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading textproto data: %v\n", err)
+		os.Exit(1)
 	}
+	fmt.Printf("Found %d trusted root certificate hashes.\n", len(trustedHashes))
 
-	rootStore := &root_store.RootStore{}
-	rootStoreData, err := os.ReadFile(rootStoreFilename)
+	// 2. Download the certificate bundle file.
+	fmt.Printf("Downloading certificates from %s...\n", certsURL)
+	certsData, err := downloadRaw(certsURL)
 	if err != nil {
-		log.Fatalf("Failed to read root_store.textproto file: %s", err)
-	} else if err = prototext.Unmarshal(rootStoreData, rootStore); err != nil {
-		log.Fatalf("Failed to parse root_store.textproto file: %s", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 
-	certsData, err := os.ReadFile(certsFilename)
+	// 3. Create the output PEM file.
+	currentTime := time.Now()
+	outputFileName := "Chrome-PEM-" + currentTime.Format("02012006") + ".pem"
+
+	outFile, err := os.Create(outputFileName)
 	if err != nil {
-		log.Fatalf("Failed to read root_store.certs file: %s", err)
+		fmt.Fprintf(os.Stderr, "Error creating output file: %v\n", err)
+		os.Exit(1)
 	}
+	defer outFile.Close()
 
-	certsMap := make(map[string]*x509.Certificate)
-	for len(certsData) > 0 {
-		var block *pem.Block
-		if block, certsData = pem.Decode(certsData); block == nil {
+	// 4. Loop through the certsData, decoding one PEM block at a time.
+	certsProcessed := 0
+	certsWritten := 0
+	data := certsData
+	for len(data) > 0 {
+		// pem.Decode will find the next PEM formatted block (e.g. -----BEGIN CERTIFICATE-----)
+		// in the data and return it, along with the rest of the data.
+		block, rest := pem.Decode(data)
+		if block == nil {
+			// This means no more PEM blocks were found.
 			break
-		} else if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
-			continue
 		}
+		certsProcessed++
 
-		var cert *x509.Certificate
-		if cert, err = x509.ParseCertificate(block.Bytes); err == nil {
-			certSHA256 := sha256.Sum256(cert.Raw)
-			certsMap[hex.EncodeToString(certSHA256[:])] = cert
-		}
-	}
+		// We are only interested in certificate blocks.
+		if block.Type == "CERTIFICATE" {
+			// Calculate the SHA-256 hash of the certificate's raw DER data.
+			hash := sha256.Sum256(block.Bytes)
+			hashHex := fmt.Sprintf("%x", hash)
 
-	// Ensure that this root store update is atomic.
-	fmt.Printf("BEGIN WORK;\n\n")
-	fmt.Printf("LOCK TABLE root_trust_purpose;\n\n")
-	fmt.Printf("DELETE FROM root_trust_purpose WHERE TRUST_CONTEXT_ID = 6;\n\n")
-
-	for _, ta := range rootStore.GetTrustAnchors() {
-		if ta != nil {
-			certName := ""
-			cm := certsMap[ta.GetSha256Hex()]
-			if cm != nil {
-				if certName = cm.Subject.CommonName; certName == "" {
-					if len(cm.Subject.OrganizationalUnit) > 0 {
-						certName = cm.Subject.OrganizationalUnit[0]
-					} else if len(cm.Subject.Organization) > 0 {
-						certName = cm.Subject.Organization[0]
-					}
+			// If the hash is in our trusted set, write the original PEM block to the file.
+			if trustedHashes[hashHex] {
+				if err := pem.Encode(outFile, block); err != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding PEM block: %v\n", err)
+					os.Exit(1)
 				}
+				certsWritten++
 			}
-			fmt.Printf("-- %s [%s]\n", certName, ta.GetSha256Hex())
-			if cm != nil {
-				fmt.Printf("SELECT import_cert(E'\\\\x%s');\n", hex.EncodeToString(cm.Raw))
-			}
-			fmt.Printf("INSERT INTO root_trust_purpose ( CERTIFICATE_ID, TRUST_CONTEXT_ID, TRUST_PURPOSE_ID ) SELECT c.ID, 6, 1 FROM certificate c WHERE (digest(c.CERTIFICATE, 'sha256') = E'\\\\x%s');\n", ta.GetSha256Hex())
-			for _, evPolicy := range ta.GetEvPolicyOids() {
-				fmt.Printf("INSERT INTO root_trust_purpose ( CERTIFICATE_ID, TRUST_CONTEXT_ID, TRUST_PURPOSE_ID ) SELECT c.ID, 6, tp.ID FROM certificate c, trust_purpose tp WHERE (digest(c.CERTIFICATE, 'sha256') = E'\\\\x%s') AND (tp.PURPOSE_OID = '%s');\n", ta.GetSha256Hex(), evPolicy)
-			}
-			fmt.Printf("\n")
 		}
+
+		// Continue the loop with the rest of the data.
+		data = rest
 	}
 
-	fmt.Printf("COMMIT WORK;\n")
+	fmt.Printf("Processed %d PEM blocks, wrote %d trusted certificates to %s\n", certsProcessed, certsWritten, outputFileName)
 }

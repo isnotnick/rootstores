@@ -61,11 +61,12 @@ func main() {
 				log.Fatal("Error grabbing cert: ", err)
 			}
 
-			certificatePEM := pem.EncodeToMemory(&pem.Block{
+			/*certificatePEM := pem.EncodeToMemory(&pem.Block{
 				Type:  "CERTIFICATE",
 				Bytes: certificateResponseBytes,
 			})
-			certificateStorePEM.WriteString(string(certificatePEM))
+			certificateStorePEM.WriteString(string(certificatePEM))*/
+			certificateStorePEM.WriteString(string(certificateResponseBytes))
 		}
 	}
 

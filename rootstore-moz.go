@@ -17,14 +17,14 @@ var certificateCounter int
 
 var certificateStorePEM strings.Builder
 
-var appleURL = "https://hg.mozilla.org/mozilla-central/raw-file/tip/security/nss/lib/ckfw/builtins/certdata.txt"
+var mozURL = "https://raw.githubusercontent.com/nss-dev/nss/refs/heads/master/lib/ckfw/builtins/certdata.txt"
 
 func main() {
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 	}
 
-	response, err := client.Get(appleURL)
+	response, err := client.Get(mozURL)
 	if err != nil {
 		log.Fatal(err)
 	}
